@@ -29,7 +29,19 @@
   "gap": {
     "confirm_s": 4.0,
     "probe_timeout_s": 20.0,
-    "min_clearance_mm": 12.0
+    "min_clearance_mm": 12.0,
+    "hold_s": 6.0,
+    "review_timeout_s": 120.0,
+    "freshness_s": 20.0,
+    "min_quorum": 0.6,
+    "agree_ratio": 0.667,
+    "manual_clear_ttl_s": 60.0,
+    "late_grace_s": 30.0,
+    "sources": [
+      {"id": "lidar", "name": "激光雷达", "weight": 0.45, "kind": "sensor"},
+      {"id": "ir", "name": "红外对射", "weight": 0.35, "kind": "sensor"},
+      {"id": "manual", "name": "人工瞭望台", "weight": 0.20, "kind": "watch"}
+    ]
   },
   "signal": {
     "refresh_period_s": 1.0,

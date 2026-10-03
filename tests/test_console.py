@@ -64,14 +64,24 @@ def test_api_mapping_and_resolve(platform):
     assert status == 409
 
 
-def test_api_action_flow(platform):
+def test_api_action_flow(platform, clock):
     api = Api(platform)
     status, arrival = api.handle(
         "POST", "/api/arrive", {}, {"train_id": "T01", "station_id": "ST1", "position_m": 0}
     )
     assert status == 200 and arrival["ok"] is True
-    status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"})
-    assert status == 200 and gap["clear"] is True
+    # 多源上报：三路一致后还需持续 confirm_s，结论才落定。
+    for source_id in ("lidar", "ir", "manual"):
+        status, gap = api.handle(
+            "POST", "/api/gap/report", {}, {"train_id": "T01", "source_id": source_id}
+        )
+        assert status == 200
+    clock.advance(platform.config.gap.confirm_s)
+    status, gap = api.handle("GET", "/api/gaps", {}, {})
+    assert status == 200 and gap["trains"][0]["clear"] is True
+    # 审计校验接口可用且一致
+    status, verify = api.handle("GET", "/api/gaps/verify", {}, {})
+    assert status == 200 and verify["ok"] is True
     status, queued = api.handle(
         "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
     )

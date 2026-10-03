@@ -72,7 +72,18 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     startup = platform.start()
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
-    gap = platform.check_gap(args.train)
+    # 多源融合：三路探测分别上报无异常，融合器按权重 + 持续时间落定为 clear。
+    gap_reports = [
+        platform.report_gap(args.train, source_id, True)
+        for source_id in ("lidar", "ir", "manual")
+    ]
+    if args.fast:
+        clock.advance(platform.config.gap.confirm_s)
+    else:
+        time.sleep(platform.config.gap.confirm_s)
+    gap = next(
+        item for item in platform.status()["gaps"]["trains"] if item["train_id"] == args.train
+    )
     queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
     processed = platform.process_queue(args.train)
     swept = platform.sweep(args.station)
@@ -99,6 +110,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "arrival": {key: arrival[key] for key in ("ok", "position_m", "violations")},
         "position": position,
         "gap": gap,
+        "gap_fusion": {
+            "sources": [report["verdict"]["sources"] for report in gap_reports],
+            "final": gap,
+        },
+        "gap_audit": platform.gap_audit_verify(),
         "queued": {key: queued[key] for key in ("ok", "train_id")},
         "processed": processed,
         "swept": swept,
@@ -168,6 +184,33 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gap_report(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.report_gap(args.train, args.source, not args.blocked))
+    return 0
+
+
+def _cmd_gap_review(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(
+        platform.review_gap(
+            args.train,
+            not args.blocked,
+            reviewer=args.reviewer,
+            role=args.role,
+            note=args.note,
+        )
+    )
+    return 0
+
+
+def _cmd_gap_verify(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    report = platform.gap_audit_verify(args.train)
+    _dump(report)
+    return 0 if report["ok"] else 1
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
@@ -210,6 +253,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    gap_report = sub.add_parser("gap-report", help="上报一路间隙探测", parents=[common])
+    gap_report.add_argument("--train", required=True)
+    gap_report.add_argument("--source", required=True, help="探测源 id（lidar/ir/manual）")
+    gap_report.add_argument("--blocked", action="store_true", help="上报为可疑")
+    gap_report.set_defaults(func=_cmd_gap_report)
+
+    gap_review = sub.add_parser("gap-review", help="人工复核间隙（盖过自动裁决）", parents=[common])
+    gap_review.add_argument("--train", required=True)
+    gap_review.add_argument("--blocked", action="store_true", help="复核结论为拦停")
+    gap_review.add_argument("--reviewer", default="supervisor")
+    gap_review.add_argument("--role", default="supervisor", choices=["operator", "supervisor"])
+    gap_review.add_argument("--note", default="")
+    gap_review.set_defaults(func=_cmd_gap_review)
+
+    gap_verify = sub.add_parser("gap-verify", help="重放间隙事件链并核对裁决指纹", parents=[common])
+    gap_verify.add_argument("--train", default="")
+    gap_verify.set_defaults(func=_cmd_gap_verify)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

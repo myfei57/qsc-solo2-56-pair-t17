@@ -31,7 +31,15 @@ from .door import (
 )
 from .errors import RailError
 from .eventbus import Event, EventBus
-from .gap import GapRegistry, gap_summary
+from .gap import (
+    FusionPolicy,
+    GapFusion,
+    GapSource,
+    gap_summary,
+    parse_sources,
+    verify_all,
+    verify_train,
+)
 from .ids import IdFactory
 from .interlock import (
     FaultRegistry,
@@ -126,7 +134,7 @@ class Platform:
         self.faults = FaultRegistry(store)
         self.armers = InterlockArmer(store)
         self.mappings = MappingRegistry(store)
-        self.gaps = GapRegistry(store)
+        self.gaps = self._build_gap_fusion()
         self.quotas = QuotaRegistry(store)
         self.commands = CommandLog(store)
         self.doors = DoorController(
@@ -141,6 +149,32 @@ class Platform:
         self._register_namespaces()
         self._seed(store)
         self._restore()
+
+    def _build_gap_fusion(self) -> GapFusion:
+        """按配置构造多源融合裁决器，审计回调直接写同一条审计流水。"""
+
+        section = self.config.gap
+        sources: tuple[GapSource, ...] = parse_sources(
+            [
+                {"id": entry[0], "name": entry[1], "weight": entry[2], "kind": entry[3]}
+                for entry in section.sources
+            ]
+        )
+        policy = FusionPolicy(
+            confirm_s=section.confirm_s,
+            hold_s=section.hold_s,
+            review_timeout_s=section.review_timeout_s,
+            freshness_s=section.freshness_s,
+            min_quorum=section.min_quorum,
+            agree_ratio=section.agree_ratio,
+            manual_clear_ttl_s=section.manual_clear_ttl_s,
+            late_grace_s=section.late_grace_s,
+        )
+
+        def gap_audit(kind: str, train_id: str, detail: dict) -> None:
+            self.audit.record(kind, train_id, "", **detail)
+
+        return GapFusion(self.store, sources=sources, policy=policy, audit_hook=gap_audit)
 
     def _on_event(self, event: Event) -> None:
         """统计总线事件，供状态接口判断动作有没有真的流过组件。"""
@@ -219,7 +253,7 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
-        restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids(self.clock.now()))
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -482,12 +516,18 @@ class Platform:
         steps.append(
             {"component": "door", "action": "close_durable", "detail": {"train_id": train_id}}
         )
-        gap_state = self.gaps.state(train_id)
+        gap_verdict = self.gaps.pump(train_id, self.clock.now())
         steps.append(
             {
                 "component": "gap",
                 "action": "check",
-                "detail": {"train_id": train_id, "state": gap_state},
+                "detail": {
+                    "train_id": train_id,
+                    "state": gap_verdict.label,
+                    "auto_label": gap_verdict.auto_label,
+                    "source": gap_verdict.source,
+                    "basis": gap_verdict.basis_hash[:12],
+                },
             }
         )
         verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
@@ -498,8 +538,17 @@ class Platform:
                 "station_id": station_id,
                 "steps": steps,
                 "violations": list(verdict["violations"]),
+                "gap_verdict": verdict.get("gap"),
             }
             summary = self._record_operation(op_id, "depart", report)
+            self.audit.record(
+                "gap_depart_blocked",
+                train_id,
+                station_id,
+                auto_label=verdict["gap"]["auto_label"],
+                source=verdict["gap"]["source"],
+                basis=verdict["gap"]["basis_hash"],
+            )
             return {**report, **summary}
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
@@ -513,24 +562,131 @@ class Platform:
             "station_id": station_id,
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
+            "gap_source": verdict["gap"]["source"],
+            "gap_basis": verdict["gap"]["basis_hash"],
             "cleared_commands": departure["cleared_commands"],
             "steps": steps,
             "violations": [],
         }
+        # 审计钉住这次放行读到的裁决指纹：审计重放核对同一指纹，三者共读一份。
+        self.audit.record(
+            "gap_depart_granted",
+            train_id,
+            station_id,
+            decision_seq=verdict["decision_seq"],
+            source=verdict["gap"]["source"],
+            basis=verdict["gap"]["basis_hash"],
+        )
         summary = self._record_operation(op_id, "depart", report)
         self._operations += 1
         self._persist()
         return {**report, **summary}
 
     def check_gap(self, train_id: str, clear: bool = True) -> dict:
-        """确认间隙无异常，或登记一次可疑探测结果。"""
+        """人工确认间隙（值班员口径）。
 
+        ``clear=True``：登记一次值班员人工确认；自动判定不是无异常时，融合裁决器
+        会拒绝，要求走 :meth:`review_gap` 由督导放行。
+        ``clear=False``：登记一路自动探测为可疑（旧演示链路兼容口径，记到主探测器）。
+        """
+
+        at = self.clock.now()
         if clear:
-            result = self.gaps.check(train_id, self.clock.now())
+            self.gaps.manual_review(
+                train_id, True, at, reviewer="operator", role="operator"
+            )
+            self.audit.record("gap_probe", train_id, "", clear=True, via="manual_confirm")
         else:
-            result = self.gaps.probe(train_id, False, self.clock.now())
-        self.audit.record("gap_probe", train_id, "", clear=clear)
-        return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
+            self.gaps.report(train_id, self.gaps.sources[0].id, False, at)
+            self.audit.record("gap_probe", train_id, "", clear=False, via="sensor")
+        verdict = self.gaps.pump(train_id, at)
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "clear": verdict.can_depart,
+            "verdict": verdict.as_dict(),
+            "violations": [],
+        }
+
+    def report_gap(self, train_id: str, source_id: str, clear: bool) -> dict:
+        """接入一路自动探测上报。"""
+
+        at = self.clock.now()
+        self.gaps.report(train_id, source_id, clear, at)
+        self.audit.record(
+            "gap_probe", train_id, "", clear=clear, source_id=source_id, via="sensor"
+        )
+        verdict = self.gaps.pump(train_id, at)
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "source_id": source_id,
+            "clear": verdict.can_depart,
+            "verdict": verdict.as_dict(),
+            "violations": [],
+        }
+
+    def mark_gap_source(self, train_id: str, source_id: str, faulty: bool) -> dict:
+        """标记一路探测故障/恢复（部分失败处置：故障源退出融合权重）。"""
+
+        at = self.clock.now()
+        self.gaps.mark_source(train_id, source_id, faulty, at)
+        self.audit.record(
+            "gap_source_fault",
+            train_id,
+            "",
+            source_id=source_id,
+            faulty=faulty,
+        )
+        verdict = self.gaps.pump(train_id, at)
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "source_id": source_id,
+            "faulty": faulty,
+            "verdict": verdict.as_dict(),
+            "violations": [],
+        }
+
+    def review_gap(
+        self,
+        train_id: str,
+        clear: bool,
+        *,
+        reviewer: str = "supervisor",
+        role: str = "supervisor",
+        note: str = "",
+    ) -> dict:
+        """登记人工复核结论；结论在有效期内盖过自动裁决。"""
+
+        at = self.clock.now()
+        event = self.gaps.manual_review(
+            train_id, clear, at, reviewer=reviewer, role=role, note=note
+        )
+        verdict = self.gaps.pump(train_id, at)
+        return {
+            "ok": True,
+            "train_id": train_id,
+            "clear": verdict.can_depart,
+            "review_seq": event.seq,
+            "verdict": verdict.as_dict(),
+            "violations": [],
+        }
+
+    def gap_audit_verify(self, train_id: str = "") -> dict:
+        """审计视角：从不可变事件链重放并核对全部发车决定的裁决指纹。"""
+
+        if train_id:
+            reports = [
+                verify_train(train_id, self.store.root, self.gaps.sources, self.gaps.policy)
+            ]
+        else:
+            reports = verify_all(self.store.root, self.gaps.sources, self.gaps.policy)
+        return {
+            "ok": all(item["consistent"] for item in reports),
+            "trains": reports,
+            "state_hash": self.gaps.state_hash(),
+        }
 
     def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
         """按最新布局重排门区映射，并按新映射联动一次。"""
@@ -687,6 +843,11 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        # 控制周期推进全部在站列车的间隙裁决：证据窗口到期升级复核、裁决落定，
+        # 都在这里按当前时钟落进不可变流水，不依赖恰好有人来查询。
+        for train in self.trains.list():
+            self.gaps.pump(train.id, moment)
+        gap_ids = [train.id for train in self.trains.list()]
         self._persist()
         return {
             "ok": True,
@@ -696,7 +857,7 @@ class Platform:
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
-            "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "gaps": gap_summary(self.gaps, gap_ids, moment),
             "violations": [],
         }
 
@@ -727,7 +888,13 @@ class Platform:
                 "disarmed": self.armers.disarms,
                 "armed_trains": self.armers.armed_trains(),
             },
-            "gap_engine": {"checks": self.gaps.checks, "probes": self.gaps.probes},
+            "gap_engine": {
+                "checks": self.gaps.checks,
+                "probes": self.gaps.probes,
+                "sources": [source.as_dict() for source in self.gaps.sources],
+                "state_hash": self.gaps.state_hash(),
+                "integrity": self.gaps.integrity(),
+            },
             "event_counts": dict(sorted(self._event_counts.items())),
             "console_hits": len(self.bus.history("console")),
             "stations": [station.as_dict() for station in self.stations.list()],
@@ -741,7 +908,7 @@ class Platform:
             "interlock": interlock_status(
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
-            "gaps": gap_summary(self.gaps, ids),
+            "gaps": gap_summary(self.gaps, ids, self.clock.now()),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
@@ -779,12 +946,14 @@ class Platform:
     def train_view(self, train_id: str) -> dict:
         """返回一列车的综合视图。"""
 
+        gap_verdict = self.gaps.verdict(train_id, self.clock.now())
         return {
             "train": self.trains.get(train_id).as_dict() if self.trains.get(train_id) else None,
             "state": train_state(train_id, self.align, self.train_doors, self.positions),
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
-            "gap": self.gaps.state(train_id),
+            "gap": gap_verdict.label,
+            "gap_verdict": gap_verdict.as_dict(),
         }
 
     def station_view(self, station_id: str) -> dict:

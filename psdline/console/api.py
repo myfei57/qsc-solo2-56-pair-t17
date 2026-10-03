@@ -66,6 +66,7 @@ class Api:
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
+        add("GET", "/api/gaps/verify", self._gap_verify)
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
@@ -77,6 +78,9 @@ class Api:
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
+        add("POST", "/api/gap/report", self._gap_report)
+        add("POST", "/api/gap/review", self._gap_review)
+        add("POST", "/api/gap/source", self._gap_source)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
@@ -199,6 +203,32 @@ class Api:
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
+
+    def _gap_report(self, params: dict, body: dict) -> dict:
+        return self._platform.report_gap(
+            _require(body, "train_id"),
+            _require(body, "source_id"),
+            bool(body.get("clear", True)),
+        )
+
+    def _gap_review(self, params: dict, body: dict) -> dict:
+        return self._platform.review_gap(
+            _require(body, "train_id"),
+            bool(body.get("clear", True)),
+            reviewer=str(body.get("reviewer", "supervisor")),
+            role=str(body.get("role", "supervisor")),
+            note=str(body.get("note", "")),
+        )
+
+    def _gap_source(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_gap_source(
+            _require(body, "train_id"),
+            _require(body, "source_id"),
+            bool(body.get("faulty", True)),
+        )
+
+    def _gap_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.gap_audit_verify(str(params.get("train_id", "")))
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue(

@@ -27,10 +27,13 @@ def platform(tmp_path, clock) -> Platform:
 
 
 @pytest.fixture()
-def online(platform) -> Platform:
-    """已到站、已开门、已确认间隙的平台。"""
+def online(platform, clock) -> Platform:
+    """已到站、已开门、三路探测一致且结论已落定的平台。"""
 
     platform.start()
     platform.arrive("T01", "ST1", 0)
-    platform.check_gap("T01")
+    for source_id in ("lidar", "ir", "manual"):
+        platform.report_gap("T01", source_id, True)
+    clock.advance(platform.config.gap.confirm_s)
+    platform.gaps.pump("T01", clock.now())
     return platform

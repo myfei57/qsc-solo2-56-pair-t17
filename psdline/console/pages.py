@@ -180,13 +180,22 @@ def _alarm_page(platform: Platform) -> str:
         ],
     )
     body += _table(
-        "间隙探测",
+        "间隙探测（多源融合裁决）",
         [
-            (item["train_id"], f"{item['state'] or '未探测'} {'已确认' if item['clear'] else ''}")
+            (
+                item["train_id"],
+                f"{item['state']}（自动:{item['auto_label']} 来源:{item['source']}）"
+                + (" 待人工复核" if item["review_required"] else ""),
+            )
             for item in status["gaps"]["trains"]
         ]
         or [("暂无", "-")],
     )
+    if status["gaps"].get("review_pending"):
+        body += _table(
+            "等待人工复核",
+            [(train_id, "需要督导裁决") for train_id in status["gaps"]["review_pending"]],
+        )
     timeline = platform.snapshot()["timeline"]
     body += _table(
         "最近审计",

@@ -63,11 +63,24 @@ class DoorSection:
 
 @dataclass(frozen=True)
 class GapSection:
-    """间隙探测限值。"""
+    """间隙探测与多源融合裁决限值。"""
 
     confirm_s: float = 4.0
     probe_timeout_s: float = 20.0
     min_clearance_mm: float = 12.0
+    # 融合裁决
+    hold_s: float = 6.0              # 结论不一致时给证据窗口的时长
+    review_timeout_s: float = 120.0  # 复核请求挂起超时（仅告警，绝不自动放行）
+    freshness_s: float = 20.0        # 探测上报保鲜窗口
+    min_quorum: float = 0.6          # 参与融合的最低权重占比
+    agree_ratio: float = 2.0 / 3.0   # 一边倒阈值
+    manual_clear_ttl_s: float = 60.0  # 人工放行有效期
+    late_grace_s: float = 30.0       # 迟到上报宽限
+    sources: tuple = (
+        ("lidar", "激光雷达", 0.45, "sensor"),
+        ("ir", "红外对射", 0.35, "sensor"),
+        ("manual", "人工瞭望台", 0.20, "watch"),
+    )
 
 
 @dataclass(frozen=True)
@@ -159,6 +172,19 @@ class PlatformConfig:
             raise ConfigError("批量开门上限必须为正", component="config")
         if self.gap.min_clearance_mm < 0:
             raise ConfigError("最小间隙不能为负", component="config")
+        if self.gap.confirm_s <= 0 or self.gap.hold_s <= 0 or self.gap.freshness_s <= 0:
+            raise ConfigError("间隙融合时间窗必须为正", component="config")
+        if not 0 < self.gap.min_quorum <= 1:
+            raise ConfigError("间隙融合最低权重占比必须落在 (0, 1]", component="config")
+        if not 0.5 < self.gap.agree_ratio <= 1:
+            raise ConfigError("间隙融合一致阈值必须落在 (0.5, 1]", component="config")
+        if self.gap.manual_clear_ttl_s <= 0:
+            raise ConfigError("人工放行有效期必须为正", component="config")
+        if not self.gap.sources:
+            raise ConfigError("间隙探测源至少配置一路", component="config")
+        for entry in self.gap.sources:
+            if len(entry) < 3 or float(entry[2]) <= 0:
+                raise ConfigError("间隙探测源权重必须为正", component="config")
         if self.signal.stale_after_s <= 0:
             raise ConfigError("位置过期时间必须为正", component="config")
         if self.signal.sequence_modulus != 65536:
@@ -192,6 +218,44 @@ def _section(cls, payload: object):
     return cls(**kwargs)
 
 
+def _gap_to_mapping(section: GapSection) -> dict:
+    """把间隙小节落成 JSON；探测源输出为对象列表。"""
+
+    payload = dict(section.__dict__)
+    payload["sources"] = [
+        {"id": entry[0], "name": entry[1], "weight": entry[2], "kind": entry[3]}
+        for entry in section.sources
+    ]
+    return payload
+
+
+def _gap_section(payload: object):
+    """从字典构造间隙小节，兼容老配置（没有 sources 时用默认三路）。"""
+
+    if not isinstance(payload, dict):
+        return GapSection()
+    known = {field_name for field_name in GapSection.__dataclass_fields__}
+    kwargs = {key: value for key, value in payload.items() if key in known}
+    sources = payload.get("sources")
+    if isinstance(sources, list) and sources:
+        parsed: list[tuple] = []
+        for item in sources:
+            if not isinstance(item, dict):
+                raise ConfigError("间隙探测源配置必须是对象", component="config")
+            parsed.append(
+                (
+                    str(item.get("id", "")),
+                    str(item.get("name", item.get("id", ""))),
+                    float(item.get("weight", 0.0)),
+                    str(item.get("kind", "sensor")),
+                )
+            )
+        kwargs["sources"] = tuple(parsed)
+    elif "sources" in kwargs:
+        kwargs.pop("sources")
+    return GapSection(**kwargs)
+
+
 def config_to_mapping(config: PlatformConfig) -> dict:
     """把配置对象转成可落盘的字典。"""
 
@@ -208,7 +272,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "station": dict(config.station.__dict__),
         "train": dict(config.train.__dict__),
         "door": dict(config.door.__dict__),
-        "gap": dict(config.gap.__dict__),
+        "gap": _gap_to_mapping(config.gap),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
@@ -228,7 +292,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         station=_section(StationSection, payload.get("station")),
         train=_section(TrainSection, payload.get("train")),
         door=_section(DoorSection, payload.get("door")),
-        gap=_section(GapSection, payload.get("gap")),
+        gap=_gap_section(payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
