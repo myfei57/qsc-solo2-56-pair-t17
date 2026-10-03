@@ -43,7 +43,7 @@ def test_depart_blocked_by_blocked_gap(platform):
     platform.check_gap("T01", clear=False)
     departure = platform.depart("T01", "ST1")
     assert departure["ok"] is False
-    assert "间隙探测未确认" in departure["violations"]
+    assert "间隙探测判定有异物" in departure["violations"]
 
 
 def test_renumber_links_new_group(platform):

@@ -1,17 +1,23 @@
 """发车放行。
 
-发车前必须同时满足两个条件：间隙探测已确认，且关门记录已落盘。两个条件缺一
-不放行，放行失败时返回具体是哪一条没满足，便于值班员判断该去复检探测还是去
-复检门控。
+发车前必须同时满足两个条件：间隙融合裁决为无异常，且关门记录已落盘。两个
+条件缺一不放行，放行失败时返回具体是哪一条没满足（探测未确认、多源未收敛、
+等待人工复核还是判定有异物），便于值班员判断该去复检探测还是去复检门控。
 """
 
 from __future__ import annotations
 
 import json
 
-from ..gap import GapRegistry
+from ..gap import BLOCKED, CLEAR, PENDING, REVIEW, GapRegistry
 from ..store import JsonStore
 from .sig import SignalController
+
+_GAP_VIOLATIONS = {
+    BLOCKED: "间隙探测判定有异物",
+    PENDING: "间隙多源探测未收敛",
+    REVIEW: "间隙探测等待人工复核",
+}
 
 
 def close_doc_id(train_id: str) -> str:
@@ -39,14 +45,16 @@ def depart_checked(
     train_id: str,
     at: float,
 ) -> dict:
-    """按顺序核对间隙确认与关门落盘，然后升起发车信号。"""
+    """按顺序核对间隙裁决与关门落盘，然后升起发车信号。"""
 
-    if not gaps.clear(train_id):
+    verdict = gaps.verdict(train_id, at)
+    if verdict.state != CLEAR:
         return {
             "ok": False,
-            "reason": "gap_not_clear",
+            "reason": f"gap_{verdict.state or 'unknown'}",
             "train_id": train_id,
-            "violations": ["间隙探测未确认"],
+            "violations": [_GAP_VIOLATIONS.get(verdict.state, "间隙探测未确认")],
+            "verdict": verdict.as_dict(),
         }
     if not close_durable(store, train_id):
         return {

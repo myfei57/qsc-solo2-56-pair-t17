@@ -29,7 +29,12 @@
   "gap": {
     "confirm_s": 4.0,
     "probe_timeout_s": 20.0,
-    "min_clearance_mm": 12.0
+    "min_clearance_mm": 12.0,
+    "source_weights": {"lidar": 2.0, "vision": 1.0, "infrared": 1.0},
+    "default_source_weight": 1.0,
+    "decision_window_s": 3.0,
+    "observation_ttl_s": 30.0,
+    "review_ttl_s": 120.0
   },
   "signal": {
     "refresh_period_s": 1.0,

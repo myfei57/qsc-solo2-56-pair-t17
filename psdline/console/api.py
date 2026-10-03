@@ -66,6 +66,7 @@ class Api:
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
+        add("GET", "/api/gaps/{trainID}", self._gap_status)
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
@@ -77,6 +78,8 @@ class Api:
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
+        add("POST", "/api/gap/observe", self._gap_observe)
+        add("POST", "/api/gap/review", self._gap_review)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
@@ -199,6 +202,23 @@ class Api:
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
+
+    def _gap_status(self, params: dict, body: dict) -> dict:
+        return self._platform.gap_view(str(params.get("trainID", "")))
+
+    def _gap_observe(self, params: dict, body: dict) -> dict:
+        return self._platform.observe_gap(
+            _require(body, "train_id"),
+            _require(body, "source"),
+            bool(body.get("clear", True)),
+        )
+
+    def _gap_review(self, params: dict, body: dict) -> dict:
+        return self._platform.review_gap(
+            _require(body, "train_id"),
+            bool(body.get("clear", True)),
+            str(body.get("reviewer", "operator")),
+        )
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue(

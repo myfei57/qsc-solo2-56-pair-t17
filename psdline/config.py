@@ -63,11 +63,18 @@ class DoorSection:
 
 @dataclass(frozen=True)
 class GapSection:
-    """间隙探测限值。"""
+    """间隙探测限值与多源融合参数。"""
 
     confirm_s: float = 4.0
     probe_timeout_s: float = 20.0
     min_clearance_mm: float = 12.0
+    source_weights: dict = field(
+        default_factory=lambda: {"lidar": 2.0, "vision": 1.0, "infrared": 1.0}
+    )
+    default_source_weight: float = 1.0
+    decision_window_s: float = 3.0
+    observation_ttl_s: float = 30.0
+    review_ttl_s: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,18 @@ class PlatformConfig:
             raise ConfigError("批量开门上限必须为正", component="config")
         if self.gap.min_clearance_mm < 0:
             raise ConfigError("最小间隙不能为负", component="config")
+        if self.gap.confirm_s < 0:
+            raise ConfigError("探测确认时间不能为负", component="config")
+        if any(weight <= 0 for weight in self.gap.source_weights.values()):
+            raise ConfigError("探测源权重必须为正", component="config")
+        if self.gap.default_source_weight <= 0:
+            raise ConfigError("默认探测源权重必须为正", component="config")
+        if self.gap.decision_window_s < 0:
+            raise ConfigError("裁决证据窗口不能为负", component="config")
+        if self.gap.observation_ttl_s <= 0:
+            raise ConfigError("探测有效期必须为正", component="config")
+        if self.gap.review_ttl_s <= 0:
+            raise ConfigError("人工复核有效期必须为正", component="config")
         if self.signal.stale_after_s <= 0:
             raise ConfigError("位置过期时间必须为正", component="config")
         if self.signal.sequence_modulus != 65536:
@@ -189,6 +208,13 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is GapSection and "source_weights" in kwargs:
+        weights = kwargs["source_weights"]
+        kwargs["source_weights"] = (
+            {str(key): float(value) for key, value in weights.items()}
+            if isinstance(weights, dict)
+            else {}
+        )
     return cls(**kwargs)
 
 
